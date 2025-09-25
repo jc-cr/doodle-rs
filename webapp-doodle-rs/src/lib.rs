@@ -1,22 +1,27 @@
 //file: lib.rs
 // desc: serve webapp
 
+// Imports
 use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
 use serde_json;
 
+// Consts
+const PICO_URL:&str = "192.168.1.100";
 const PIXEL_GRID_SIZE: usize = 48;
 const CANVAS_SIZE: f64 = 480.0; // 10x scale for better UX
 const PIXEL_SIZE: f64 = CANVAS_SIZE / PIXEL_GRID_SIZE as f64; // 10 pixels per grid cell
 
+// Structs
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PixelCoord {
     x: usize,
     y: usize,
 }
 
+// Fns
 #[component]
 fn DrawingCanvas() -> impl IntoView {
     let canvas_ref = create_node_ref::<leptos::html::Canvas>();
@@ -147,6 +152,7 @@ fn DrawingCanvas() -> impl IntoView {
             
             <div class="canvas-container">
                 <canvas
+                    class="drawing-canvas"
                     _ref=canvas_ref
                     width=CANVAS_SIZE.to_string()
                     height=CANVAS_SIZE.to_string()
@@ -154,7 +160,6 @@ fn DrawingCanvas() -> impl IntoView {
                     on:mousemove=on_mouse_move
                     on:mouseup=on_mouse_up
                     on:mouseleave=move |_| set_is_drawing.set(false)
-                    style="border: 1px solid #ccc; cursor: crosshair;"
                 />
             </div>
             
@@ -170,7 +175,7 @@ fn DrawingCanvas() -> impl IntoView {
                     }
                     count
                 }}</p>
-                <p style="color: #4CAF50;">"✓ Real-time sync to Pico 2W"</p>
+                <p class="sync-status">"✓ Real-time sync to Pico 2W"</p>
             </div>
         </div>
     }
@@ -181,7 +186,7 @@ async fn send_pixel_change_to_pico(x: usize, y: usize, state: bool) -> Result<()
     let client = reqwest::Client::new();
     
     // Replace with your Pico 2W's IP address
-    let pico_url = "http://192.168.1.100/pixel"; // New endpoint for individual pixels
+    let pico_pixel_url = format!("http://{}/pixel", PICO_URL); // New endpoint for individual pixels
     
     // Send as JSON: {"x": 10, "y": 5, "state": true}
     let pixel_data = serde_json::json!({
@@ -191,7 +196,7 @@ async fn send_pixel_change_to_pico(x: usize, y: usize, state: bool) -> Result<()
     });
     
     let response = client
-        .post(pico_url)
+        .post(pico_pixel_url)
         .header("Content-Type", "application/json")
         .json(&pixel_data)
         .send()
@@ -209,10 +214,10 @@ async fn send_clear_to_pico() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     
     // Replace with your Pico 2W's IP address
-    let pico_url = "http://192.168.1.100/clear"; // New endpoint for clearing
+    let pico_clear_url = format!("http://{}/pixel", PICO_URL); // New endpoint for individual pixels
     
     let response = client
-        .post(pico_url)
+        .post(pico_clear_url)
         .send()
         .await?;
     
