@@ -2,27 +2,281 @@
 // desc: serve webapp
 
 use leptos::*;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
+
+
+const PIXEL_GRID_SIZE: usize = 48;
+const CANVAS_SIZE: f64 = 480.0; // 10x scale for better UX
+const PIXEL_SIZE: f64 = CANVAS_SIZE / PIXEL_GRID_SIZE as f64; // 10 pixels per grid cell
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PixelCoord {
+    x: usize,
+    y: usize,
+}
 
 #[component]
-fn App() -> impl IntoView {
-    let (count, set_count) = create_signal(0);
+fn DrawingCanvas() -> impl IntoView {
+    let canvas_ref = create_node_ref::<leptos::html::Canvas>();
+    let (pixel_grid, set_pixel_grid) = create_signal([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
+    let (is_drawing, set_is_drawing) = create_signal(false);
+
+    // Initialize canvas context
+    let canvas_context = create_memo(move |_| {
+        canvas_ref.get().and_then(|canvas| {
+            let canvas_element = canvas.unchecked_ref::<HtmlCanvasElement>();
+            canvas_element
+                .get_context("2d")
+                .ok()?
+                .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok())
+        })
+    });
+
+    // Redraw canvas when pixel grid changes
+    create_effect(move |_| {
+        let grid = pixel_grid.get();
+        
+        if let Some(ctx) = canvas_context.get() {
+            // Clear canvas
+            ctx.clear_rect(0.0, 0.0, CANVAS_SIZE, CANVAS_SIZE);
+            
+            // Draw grid lines (light gray)
+            ctx.set_stroke_style_str("#e0e0e0");
+            ctx.set_line_width(1.0);
+            ctx.begin_path();
+            
+            for i in 0..=PIXEL_GRID_SIZE {
+                let pos = i as f64 * PIXEL_SIZE;
+                // Vertical lines
+                ctx.move_to(pos, 0.0);
+                ctx.line_to(pos, CANVAS_SIZE);
+                // Horizontal lines
+                ctx.move_to(0.0, pos);
+                ctx.line_to(CANVAS_SIZE, pos);
+            }
+            ctx.stroke();
+            
+            // Draw filled pixels (black squares)
+            ctx.set_fill_style_str("#000000");
+            for (y, row) in grid.iter().enumerate() {
+                for (x, &pixel) in row.iter().enumerate() {
+                    if pixel {
+                        let rect_x = x as f64 * PIXEL_SIZE;
+                        let rect_y = y as f64 * PIXEL_SIZE;
+                        ctx.fill_rect(rect_x, rect_y, PIXEL_SIZE, PIXEL_SIZE);
+                    }
+                }
+            }
+        }
+    });
+
+    // Convert mouse coordinates to pixel grid coordinates
+    let mouse_to_pixel_coords = move |mouse_event: &MouseEvent| -> Option<PixelCoord> {
+        let canvas = canvas_ref.get()?;
+        let canvas_element = canvas.unchecked_ref::<HtmlCanvasElement>();
+        let rect = canvas_element.get_bounding_client_rect();
+        
+        let canvas_x = mouse_event.client_x() as f64 - rect.left();
+        let canvas_y = mouse_event.client_y() as f64 - rect.top();
+        
+        let pixel_x = (canvas_x / PIXEL_SIZE).floor() as usize;
+        let pixel_y = (canvas_y / PIXEL_SIZE).floor() as usize;
+        
+        if pixel_x < PIXEL_GRID_SIZE && pixel_y < PIXEL_GRID_SIZE {
+            Some(PixelCoord { x: pixel_x, y: pixel_y })
+        } else {
+            None
+        }
+    };
+
+    // Handle drawing on pixel
+    let draw_pixel = move |coord: PixelCoord| {
+        set_pixel_grid.update(|grid| {
+            grid[coord.y][coord.x] = true;
+        });
+    };
+
+    // Mouse event handlers
+    let on_mouse_down = move |e: MouseEvent| {
+        if let Some(coord) = mouse_to_pixel_coords(&e) {
+            set_is_drawing.set(true);
+            draw_pixel(coord);
+        }
+    };
+
+    let on_mouse_move = move |e: MouseEvent| {
+        if is_drawing.get() {
+            if let Some(coord) = mouse_to_pixel_coords(&e) {
+                draw_pixel(coord);
+            }
+        }
+    };
+
+    let on_mouse_up = move |_: MouseEvent| {
+        set_is_drawing.set(false);
+    };
+
+    // Clear canvas function
+    let clear_canvas = move |_| {
+        set_pixel_grid.set([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
+    };
+
+    // Send to Pico 2W function
+    let send_to_pico = move |_| {
+        let grid = pixel_grid.get();
+        
+        // Convert 2D grid to 1D binary array
+        let mut pixel_data = Vec::new();
+        for row in grid.iter() {
+            for &pixel in row.iter() {
+                pixel_data.push(if pixel { 1u8 } else { 0u8 });
+            }
+        }
+        
+        spawn_local(async move {
+            match send_pixel_data_to_pico(pixel_data).await {
+                Ok(_) => log::info!("Successfully sent pixel data to Pico 2W"),
+                Err(e) => log::error!("Failed to send data to Pico 2W: {}", e),
+            }
+        });
+    };
 
     view! {
-        <div>
-            <h1>"Doodle-RS"</h1>
-            <p>"Canvas placeholder coming soon..."</p>
-            <button
-                on:click=move |_| {
-                    set_count.update(|n| *n += 1);
-                }
-            >
-                "Click me: " {count}
-            </button>
+        <div class="drawing-container">
+            <div class="controls">
+                <button on:click=clear_canvas>"Clear"</button>
+                <button on:click=send_to_pico class="send-btn">"Send to Pico 2W"</button>
+            </div>
+            
+            <div class="canvas-container">
+                <canvas
+                    _ref=canvas_ref
+                    width=CANVAS_SIZE.to_string()
+                    height=CANVAS_SIZE.to_string()
+                    on:mousedown=on_mouse_down
+                    on:mousemove=on_mouse_move
+                    on:mouseup=on_mouse_up
+                    on:mouseleave=move |_| set_is_drawing.set(false)
+                    style="border: 1px solid #ccc; cursor: crosshair;"
+                />
+            </div>
+            
+            <div class="info">
+                <p>"Resolution: " {PIXEL_GRID_SIZE} "x" {PIXEL_GRID_SIZE} " pixels"</p>
+                <p>"Pixels drawn: " {move || {
+                    let grid = pixel_grid.get();
+                    let mut count = 0;
+                    for row in grid.iter() {
+                        for &pixel in row.iter() {
+                            if pixel { count += 1; }
+                        }
+                    }
+                    count
+                }}</p>
+            </div>
         </div>
     }
 }
 
+// Function to send pixel data to Pico 2W
+async fn send_pixel_data_to_pico(pixel_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    
+    // Replace with your Pico 2W's IP address
+    let pico_url = "http://192.168.1.100/pixels"; // Adjust this to your Pico's IP
+    
+    let response = client
+        .post(pico_url)
+        .header("Content-Type", "application/octet-stream")
+        .body(pixel_data)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTP error: {}", response.status()).into())
+    }
+}
+
+#[component]
+fn App() -> impl IntoView {
+    view! {
+        <div class="app">
+            <style>
+                "
+                .app {
+                    font-family: Arial, sans-serif;
+                    max-width: 600px;
+                    margin: 0 auto;
+                    padding: 20px;
+                }
+                
+                .drawing-container {
+                    text-align: center;
+                    user-select: none;
+                }
+                
+                .controls {
+                    margin-bottom: 20px;
+                    display: flex;
+                    justify-content: center;
+                    gap: 10px;
+                }
+                
+                .controls button {
+                    padding: 8px 16px;
+                    border: 1px solid #ccc;
+                    background: #f9f9f9;
+                    cursor: pointer;
+                    border-radius: 4px;
+                }
+                
+                .controls button:hover {
+                    background: #e9e9e9;
+                }
+                
+                .send-btn {
+                    background: #4CAF50 !important;
+                    color: white !important;
+                    border: 1px solid #45a049 !important;
+                }
+                
+                .send-btn:hover {
+                    background: #45a049 !important;
+                }
+                
+                .canvas-container {
+                    display: inline-block;
+                    border: 2px solid #333;
+                    border-radius: 4px;
+                }
+                
+                .info {
+                    margin-top: 15px;
+                    color: #666;
+                    font-size: 14px;
+                }
+                
+                .info p {
+                    margin: 5px 0;
+                }
+                "
+            </style>
+            
+            <h1>"Doodle-RS"</h1>
+            <p>"Draw on the canvas below. Each square represents a pixel on your 48x48 OLED display."</p>
+            
+            <DrawingCanvas/>
+        </div>
+    }
+}
+
+#[wasm_bindgen(start)]
 fn main() {
     console_error_panic_hook::set_once();
-    leptos::mount_to_body(App)
+    console_log::init_with_level(log::Level::Info).ok();
+    leptos::mount_to_body(App);
 }
