@@ -5,7 +5,7 @@ use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
-
+use serde_json;
 
 const PIXEL_GRID_SIZE: usize = 48;
 const CANVAS_SIZE: f64 = 480.0; // 10x scale for better UX
@@ -96,6 +96,14 @@ fn DrawingCanvas() -> impl IntoView {
         set_pixel_grid.update(|grid| {
             grid[coord.y][coord.x] = true;
         });
+        
+        // Send pixel change to Pico 2W immediately
+        spawn_local(async move {
+            match send_pixel_change_to_pico(coord.x, coord.y, true).await {
+                Ok(_) => log::debug!("Sent pixel change: ({}, {}) = ON", coord.x, coord.y),
+                Err(e) => log::error!("Failed to send pixel change: {}", e),
+            }
+        });
     };
 
     // Mouse event handlers
@@ -121,24 +129,12 @@ fn DrawingCanvas() -> impl IntoView {
     // Clear canvas function
     let clear_canvas = move |_| {
         set_pixel_grid.set([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
-    };
-
-    // Send to Pico 2W function
-    let send_to_pico = move |_| {
-        let grid = pixel_grid.get();
         
-        // Convert 2D grid to 1D binary array
-        let mut pixel_data = Vec::new();
-        for row in grid.iter() {
-            for &pixel in row.iter() {
-                pixel_data.push(if pixel { 1u8 } else { 0u8 });
-            }
-        }
-        
+        // Send clear command to Pico 2W
         spawn_local(async move {
-            match send_pixel_data_to_pico(pixel_data).await {
-                Ok(_) => log::info!("Successfully sent pixel data to Pico 2W"),
-                Err(e) => log::error!("Failed to send data to Pico 2W: {}", e),
+            match send_clear_to_pico().await {
+                Ok(_) => log::info!("Sent clear command to Pico 2W"),
+                Err(e) => log::error!("Failed to send clear command: {}", e),
             }
         });
     };
@@ -147,7 +143,6 @@ fn DrawingCanvas() -> impl IntoView {
         <div class="drawing-container">
             <div class="controls">
                 <button on:click=clear_canvas>"Clear"</button>
-                <button on:click=send_to_pico class="send-btn">"Send to Pico 2W"</button>
             </div>
             
             <div class="canvas-container">
@@ -175,22 +170,49 @@ fn DrawingCanvas() -> impl IntoView {
                     }
                     count
                 }}</p>
+                <p style="color: #4CAF50;">"✓ Real-time sync to Pico 2W"</p>
             </div>
         </div>
     }
 }
 
-// Function to send pixel data to Pico 2W
-async fn send_pixel_data_to_pico(pixel_data: Vec<u8>) -> Result<(), Box<dyn std::error::Error>> {
+// Function to send individual pixel change to Pico 2W
+async fn send_pixel_change_to_pico(x: usize, y: usize, state: bool) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     
     // Replace with your Pico 2W's IP address
-    let pico_url = "http://192.168.1.100/pixels"; // Adjust this to your Pico's IP
+    let pico_url = "http://192.168.1.100/pixel"; // New endpoint for individual pixels
+    
+    // Send as JSON: {"x": 10, "y": 5, "state": true}
+    let pixel_data = serde_json::json!({
+        "x": x,
+        "y": y,
+        "state": state
+    });
     
     let response = client
         .post(pico_url)
-        .header("Content-Type", "application/octet-stream")
-        .body(pixel_data)
+        .header("Content-Type", "application/json")
+        .json(&pixel_data)
+        .send()
+        .await?;
+    
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("HTTP error: {}", response.status()).into())
+    }
+}
+
+// Function to send clear command to Pico 2W
+async fn send_clear_to_pico() -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    
+    // Replace with your Pico 2W's IP address
+    let pico_url = "http://192.168.1.100/clear"; // New endpoint for clearing
+    
+    let response = client
+        .post(pico_url)
         .send()
         .await?;
     
@@ -275,7 +297,7 @@ fn App() -> impl IntoView {
 }
 
 #[wasm_bindgen(start)]
-fn main() {
+pub fn main() {
     console_error_panic_hook::set_once();
     console_log::init_with_level(log::Level::Info).ok();
     leptos::mount_to_body(App);
