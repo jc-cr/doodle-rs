@@ -13,9 +13,78 @@ target
 # Contains mutation testing data
 **/mutants.out*/
 
-# RustRover
-#  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
-#  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
-#  and can be added to the global gitignore or merged into this file.  For a more nuclear
-#  option (not recommended) you can uncomment the following to ignore the entire idea folder.
-#.idea/
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo
+Cargo.lock
+/*/release
+/*/debug
+/*/thumbv8m.main-none-eabihf
+
+# Build and cache directories (from container environment setup)
+/.cargo/
+/.rustup/
+/target/
+/.cache/
+/.config/
+/.local/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Docker
+.dockerignore
+*.log
+
+# Embedded / Hardware
+*.hex
+*.elf
+*.map
+*.lst
+*.dmp
+# Exclude .bin files but allow firmware
+*.bin
+!/pico-blink/cyw43-firmware/*.bin
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.exe
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Backup files
+*.bak
+*.backup
+
+# Debug files
+gdb_history
+.gdb_history
+
+# Probe-rs cache
+.probe-rs/

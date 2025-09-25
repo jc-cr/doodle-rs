@@ -1,0 +1,29 @@
+services:
+  pico-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.rust
+    volumes:
+      - ..:/app
+      - /home/jc/.secrets/pico2w-proj.env:/home/wifi.env:ro
+      - /dev/bus/usb:/dev/bus/usb  # For USB device access
+    user: "${UID:-1000}:${GID:-1000}"
+    privileged: true  # Required for USB device access
+    working_dir: /app
+
+
+  pico_bash:
+    extends: pico-dev
+    working_dir: /app
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+  pico_build:
+     working_dir: /app/oled-wifi-control
+     extends: pico-dev
+     command: bash -c "set -a && source /home/wifi.env && set +a && cargo build --target-dir . --target thumbv8m.main-none-eabihf"
+  # Plug in board in boot mode
+  pico_flash:
+     working_dir: /app/oled-wifi-control
+     extends: pico-dev
+     command: bash -c "set -a && source /home/wifi.env && set +a && cargo run --release --target-dir . --target thumbv8m.main-none-eabihf"
