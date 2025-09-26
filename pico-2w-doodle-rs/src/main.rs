@@ -17,8 +17,8 @@ mod setup_devices;
 use setup_devices::{setup_display, setup_wifi};
 
 // Import task mods
-//mod display_task;
-//use display_task::{display_task};
+mod display_task;
+use display_task::{display_task};
 mod networking_task;
 use networking_task::{networking_task};
 
@@ -45,9 +45,9 @@ async fn main(spawner: Spawner) {
     let (reader, writer) = drawing_pipe.split();
     
     // Setup individual components
-   //  let display = setup_display(p.I2C0, 
-   //      p.PIN_0, 
-   //      p.PIN_1).await;
+    let display = setup_display(p.I2C0, 
+       p.PIN_0, 
+       p.PIN_1).await;
     
     let wifi_stack = setup_wifi(
         p.PIO0,
@@ -62,7 +62,7 @@ async fn main(spawner: Spawner) {
     info!("System initialization complete!");
 
     // Create tasks
-    //spawner.spawn(display_task(display, reader)).unwrap();
+    spawner.spawn(display_task(display, reader)).unwrap();
     spawner.spawn(networking_task(wifi_stack, writer)).unwrap();
     
     // Main animation loop

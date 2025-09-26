@@ -34,7 +34,6 @@ portable-atomic = { version = "1.5", features = ["critical-section"] }
 # OLED and graphics dependencies
 ssd1306 = "0.8.4"
 embedded-graphics = "0.8.1"
-tinybmp = "0.5"
 heapless = "0.8"
 
 
