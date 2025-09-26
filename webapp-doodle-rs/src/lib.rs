@@ -1,5 +1,5 @@
 //file: lib.rs
-// desc: serve webapp
+// desc: serve webapp with queued pixel updates
 
 // Imports
 use leptos::*;
@@ -7,6 +7,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
 use serde_json;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
+use std::cell::RefCell;
 
 // Consts
 const PICO_URL:&str = "192.168.68.100";
@@ -14,11 +17,27 @@ const PIXEL_GRID_SIZE: usize = 48;
 const CANVAS_SIZE: f64 = 480.0; // 10x scale for better UX
 const PIXEL_SIZE: f64 = CANVAS_SIZE / PIXEL_GRID_SIZE as f64; // 10 pixels per grid cell
 
+// Send rate limiting - adjust these values as needed
+const SEND_INTERVAL_MS: i32 = 5; // Send batches every x ms
+const MAX_BATCH_SIZE: usize = 2048;  // Max pixels per batch
+
 // Structs
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct PixelCoord {
     x: usize,
     y: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PixelUpdate {
+    coord: PixelCoord,
+    state: bool,
+}
+
+// Global pixel queue - using thread-local storage for web environment
+thread_local! {
+    static PIXEL_QUEUE: Rc<RefCell<VecDeque<PixelUpdate>>> = Rc::new(RefCell::new(VecDeque::new()));
+    static PENDING_PIXELS: Rc<RefCell<HashMap<PixelCoord, bool>>> = Rc::new(RefCell::new(HashMap::new()));
 }
 
 // Fns
@@ -27,6 +46,7 @@ fn DrawingCanvas() -> impl IntoView {
     let canvas_ref = create_node_ref::<leptos::html::Canvas>();
     let (pixel_grid, set_pixel_grid) = create_signal([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
     let (is_drawing, set_is_drawing) = create_signal(false);
+    let (queue_stats, set_queue_stats) = create_signal((0usize, 0usize)); // (queue_size, pending_size)
 
     // Initialize canvas context
     let canvas_context = create_memo(move |_| {
@@ -37,6 +57,11 @@ fn DrawingCanvas() -> impl IntoView {
                 .ok()?
                 .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok())
         })
+    });
+
+    // Start the pixel queue processor when component mounts
+    create_effect(move |_| {
+        start_pixel_queue_processor(set_queue_stats);
     });
 
     // Redraw canvas when pixel grid changes
@@ -96,19 +121,15 @@ fn DrawingCanvas() -> impl IntoView {
         }
     };
 
-    // Handle drawing on pixel
+    // Handle drawing on pixel - now with queuing
     let draw_pixel = move |coord: PixelCoord| {
+        // Update visual grid immediately for responsive UI
         set_pixel_grid.update(|grid| {
             grid[coord.y][coord.x] = true;
         });
         
-        // Send pixel change to Pico 2W immediately
-        spawn_local(async move {
-            match send_pixel_change_to_pico(coord.x, coord.y, true).await {
-                Ok(_) => log::debug!("Sent pixel change: ({}, {}) = ON", coord.x, coord.y),
-                Err(e) => log::error!("Failed to send pixel change: {}", e),
-            }
-        });
+        // Queue the pixel change for sending to Pico
+        queue_pixel_update(coord, true);
     };
 
     // Mouse event handlers
@@ -135,7 +156,8 @@ fn DrawingCanvas() -> impl IntoView {
     let clear_canvas = move |_| {
         set_pixel_grid.set([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
         
-        // Send clear command to Pico 2W
+        // Clear any pending pixel updates and send clear command immediately
+        clear_pixel_queue();
         spawn_local(async move {
             match send_clear_to_pico().await {
                 Ok(_) => log::info!("Sent clear command to Pico 2W"),
@@ -176,9 +198,93 @@ fn DrawingCanvas() -> impl IntoView {
                     count
                 }}</p>
                 <p class="sync-status">"✓ Real-time sync to Pico 2W"</p>
+                <p class="queue-stats">
+                    "Queue: " {move || queue_stats.get().0} " | Pending: " {move || queue_stats.get().1}
+                </p>
             </div>
         </div>
     }
+}
+
+// Queue management functions
+fn queue_pixel_update(coord: PixelCoord, state: bool) {
+    let update = PixelUpdate { coord, state };
+    
+    PENDING_PIXELS.with(|pending| {
+        let mut pending = pending.borrow_mut();
+        // Update or insert the latest state for this coordinate
+        pending.insert(coord, state);
+    });
+}
+
+fn clear_pixel_queue() {
+    PIXEL_QUEUE.with(|queue| {
+        queue.borrow_mut().clear();
+    });
+    PENDING_PIXELS.with(|pending| {
+        pending.borrow_mut().clear();
+    });
+}
+
+fn start_pixel_queue_processor(set_queue_stats: WriteSignal<(usize, usize)>) {
+    use wasm_bindgen_futures::spawn_local;
+    use gloo_timers::future::TimeoutFuture;
+    
+    spawn_local(async move {
+        loop {
+            // Wait for the next interval
+            TimeoutFuture::new(SEND_INTERVAL_MS as u32).await;
+            
+            // Process pending pixels
+            let pixels_to_send = PENDING_PIXELS.with(|pending| {
+                let mut pending = pending.borrow_mut();
+                if pending.is_empty() {
+                    return Vec::new();
+                }
+                
+                // Take up to MAX_BATCH_SIZE pixels
+                let mut batch = Vec::new();
+                let mut keys_to_remove = Vec::new();
+                
+                for (&coord, &state) in pending.iter().take(MAX_BATCH_SIZE) {
+                    batch.push(PixelUpdate { coord, state });
+                    keys_to_remove.push(coord);
+                }
+                
+                // Remove processed pixels
+                for key in keys_to_remove {
+                    pending.remove(&key);
+                }
+                
+                batch
+            });
+            
+            // Update stats
+            let queue_size = PIXEL_QUEUE.with(|q| q.borrow().len());
+            let pending_size = PENDING_PIXELS.with(|p| p.borrow().len());
+            set_queue_stats.set((queue_size, pending_size));
+            
+            // Send pixels if any
+            if !pixels_to_send.is_empty() {
+                log::debug!("Sending batch of {} pixels", pixels_to_send.len());
+                
+                for pixel_update in pixels_to_send {
+                    match send_pixel_change_to_pico(pixel_update.coord.x, pixel_update.coord.y, pixel_update.state).await {
+                        Ok(_) => {
+                            log::debug!("Sent pixel: ({}, {}) = {}", pixel_update.coord.x, pixel_update.coord.y, pixel_update.state);
+                        },
+                        Err(e) => {
+                            log::error!("Failed to send pixel change: {}", e);
+                            // On error, we could re-queue the pixel, but for now just log and continue
+                        }
+                    }
+                    
+                    // Small delay between pixels in the batch to avoid overwhelming
+                    TimeoutFuture::new(5).await;
+                }
+            }
+        }
+    });
 }
 
 // Function to send individual pixel change to Pico 2W
@@ -289,11 +395,18 @@ fn App() -> impl IntoView {
                 .info p {
                     margin: 5px 0;
                 }
+                
+                .queue-stats {
+                    font-family: monospace;
+                    font-size: 12px;
+                    color: #999;
+                }
                 "
             </style>
             
             <h1>"Doodle-RS"</h1>
             <p>"Draw on the canvas below. Each square represents a pixel on your 48x48 OLED display."</p>
+            <p class="help-text">"Pixel updates are queued and sent at a controlled rate to prevent overwhelming the Pico."</p>
             
             <DrawingCanvas/>
         </div>
