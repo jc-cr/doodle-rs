@@ -213,8 +213,7 @@ async fn send_pixel_change_to_pico(x: usize, y: usize, state: bool) -> Result<()
 async fn send_clear_to_pico() -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     
-    // Replace with your Pico 2W's IP address
-    let pico_clear_url = format!("http://{}/pixel", PICO_URL); // New endpoint for individual pixels
+    let pico_clear_url = format!("http://{}/clear", PICO_URL);
     
     let response = client
         .post(pico_clear_url)

@@ -92,7 +92,7 @@ pub async fn setup_wifi(
     });
     let seed = rng.next_u64();
     
-    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<10>> = StaticCell::new();
     static STACK: StaticCell<Stack<'static>> = StaticCell::new();
     
     let (stack, runner) = embassy_net::new(

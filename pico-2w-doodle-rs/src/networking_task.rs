@@ -33,56 +33,66 @@ pub async fn networking_task(
     // Connect to WiFi
     connect_wifi(&mut wifi_stack).await;
     
-    // HTTP server loop
-    let mut rx_buffer = [0; 2048];
-    let mut tx_buffer = [0; 1024];
-    let mut request_buffer = [0; 1024];
+    // HTTP server loop - increased buffer sizes for better performance
+    let mut rx_buffer = [0; 4096];
+    let mut tx_buffer = [0; 4096];
 
     loop {
-        // Dereference the stack
+        // Create socket with minimal timeout for fast cycling
         let mut socket = TcpSocket::new(*wifi_stack.stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_secs(10)));
+        socket.set_timeout(Some(Duration::from_millis(500)));
 
-        info!("Listening for HTTP connections on port 80...");
-        
-        if let Err(e) = socket.accept(80).await {
-            warn!("Socket accept error: {:?}", e);
-            Timer::after(Duration::from_secs(1)).await;
-            continue;
-        }
-
-        info!("New HTTP connection from {:?}", socket.remote_endpoint());
-
-        // Handle request
-        if let Ok(bytes_read) = socket.read(&mut request_buffer).await {
-            if bytes_read > 0 {
-                let request = from_utf8(&request_buffer[..bytes_read]).unwrap_or("Invalid UTF-8");
-                info!("HTTP Request: {=str}", &request[..request.len().min(200)]);
-
-                let response = handle_http_request(request, &mut pipe_writer).await;
+        // Try to accept connection - this should be VERY fast
+        match socket.accept(80).await {
+            Ok(_) => {
+                info!("Connection from {:?}", socket.remote_endpoint());
                 
-                info!("Sending response: {=str}", &response[..response.len().min(100)]);
-                
-                // Write response using the correct TcpSocket API
-                let response_bytes = response.as_bytes();
-                let mut written = 0;
-                while written < response_bytes.len() {
-                    match socket.write(&response_bytes[written..]).await {
-                        Ok(n) if n > 0 => written += n,
-                        Ok(_) => break, // No progress
-                        Err(e) => {
-                            warn!("Write error: {:?}", e);
-                            break;
+                // Handle this connection - read request quickly
+                let mut request_buffer = [0; 2048];
+                match socket.read(&mut request_buffer).await {
+                    Ok(bytes_read) if bytes_read > 0 => {
+                        let request = from_utf8(&request_buffer[..bytes_read]).unwrap_or("Invalid UTF-8");
+                        info!("Request: {=str}", &request[..request.len().min(100)]);
+
+                        // Generate and send response immediately
+                        let response = handle_http_request(request, &mut pipe_writer).await;
+                        let response_bytes = response.as_bytes();
+                        
+                        // Write entire response
+                        let mut written = 0;
+                        while written < response_bytes.len() {
+                            match socket.write(&response_bytes[written..]).await {
+                                Ok(n) if n > 0 => {
+                                    written += n;
+                                },
+                                Ok(_) => break,
+                                Err(e) => {
+                                    warn!("Write failed: {:?}", e);
+                                    break;
+                                }
+                            }
                         }
-                    }
+                        
+                        // Ensure data is sent before closing
+                        let _ = socket.flush().await;
+                        info!("Response sent: {} bytes", written);
+                    },
+                    Ok(_) => info!("Empty request"),
+                    Err(e) => warn!("Read error: {:?}", e),
                 }
-                info!("Wrote {} of {} bytes", written, response_bytes.len());
+                
+                // Close this connection cleanly
+                socket.close();
+                
+                // MINIMAL delay before accepting next connection
+                Timer::after(Duration::from_millis(1)).await;
+            },
+            Err(_) => {
+                // No connection waiting, loop immediately to try again
+                // This makes the server VERY responsive
+                Timer::after(Duration::from_micros(100)).await;
             }
         }
-
-        // Always close and add delay
-        socket.close();
-        Timer::after(Duration::from_millis(100)).await;
     }
 }
 
@@ -92,16 +102,33 @@ fn build_simple_response(body: &str) -> String<512> {
     let _ = response.push_str("Access-Control-Allow-Origin: *\r\n");
     let _ = response.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
     let _ = response.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
+    let _ = response.push_str("Connection: close\r\n");
     let _ = response.push_str("Content-Type: text/plain\r\n");
     let _ = response.push_str("Content-Length: ");
     
-    // Simple length calculation
+    // Fixed content-length calculation to handle any size
     let body_len = body.len();
-    if body_len < 10 {
-        let _ = response.push((b'0' + body_len as u8) as char);
+    
+    // Convert length to string digits
+    if body_len == 0 {
+        let _ = response.push('0');
     } else {
-        let _ = response.push('1');
-        let _ = response.push((b'0' + (body_len - 10) as u8) as char);
+        // Handle multi-digit lengths properly
+        let mut n = body_len;
+        let mut digits = [0u8; 8];
+        let mut digit_count = 0;
+        
+        // Extract digits
+        while n > 0 {
+            digits[digit_count] = (n % 10) as u8;
+            n /= 10;
+            digit_count += 1;
+        }
+        
+        // Add digits in reverse order
+        for i in (0..digit_count).rev() {
+            let _ = response.push((b'0' + digits[i]) as char);
+        }
     }
     
     let _ = response.push_str("\r\n\r\n");
@@ -135,21 +162,21 @@ async fn handle_http_request(
         // Handle CORS preflight requests - CRITICAL for browser requests
         ("OPTIONS", _) => {
             info!("CORS preflight request");
+            // Return empty body for OPTIONS requests
             build_simple_response("")
         },
         
         // Handle individual pixel updates
         ("POST", "/pixel") => {
             if let Some(json_body) = extract_json_body(request) {
-                info!("Received JSON body: {=str}", &json_body[..json_body.len().min(50)]);
+                info!("JSON: {=str}", &json_body[..json_body.len().min(50)]);
                 match parse_pixel_request(json_body) {
                     Ok(pixel_req) => {
-                        info!("Pixel update: x={}, y={}, state={}", pixel_req.x, pixel_req.y, pixel_req.state);
+                        info!("Pixel: x={}, y={}, state={}", pixel_req.x, pixel_req.y, pixel_req.state);
                         
                         // Send pixel data through pipe to display task
                         let pixel_data = [pixel_req.x, pixel_req.y, if pixel_req.state { 1 } else { 0 }];
-                        let bytes_written = pipe_writer.write(&pixel_data).await;
-                        info!("Wrote {} bytes to pipe", bytes_written);
+                        let _ = pipe_writer.write(&pixel_data).await;
                         
                         build_simple_response("OK")
                     },
@@ -166,12 +193,11 @@ async fn handle_http_request(
         
         // Handle clear command  
         ("POST", "/clear") => {
-            info!("Clear display command received");
+            info!("Clear display command");
             
             // Send clear command through pipe (special command: 255, 255, 2)
             let clear_data = [255u8, 255u8, 2u8];
-            let bytes_written = pipe_writer.write(&clear_data).await;
-            info!("Wrote {} bytes to pipe for clear command", bytes_written);
+            let _ = pipe_writer.write(&clear_data).await;
             
             build_simple_response("Cleared")
         },
@@ -183,7 +209,7 @@ async fn handle_http_request(
         
         // 404 for unknown endpoints
         _ => {
-            warn!("Unknown endpoint: {} {}", method, path);
+            warn!("Unknown: {} {}", method, path);
             build_simple_response("Not Found")
         }
     }
@@ -243,7 +269,7 @@ fn parse_pixel_request(json: &str) -> Result<PixelRequest, ()> {
 }
 
 async fn connect_wifi(wifi_stack: &mut WifiStack) {
-    info!("Attempting to connect to WiFi network: {}", WIFI_NETWORK);
+    info!("Connecting to WiFi: {}", WIFI_NETWORK);
     
     loop {
         match wifi_stack.wifi_controller
@@ -251,11 +277,11 @@ async fn connect_wifi(wifi_stack: &mut WifiStack) {
             .await
         {
             Ok(_) => {
-                info!("WiFi connection successful!");
+                info!("WiFi connected!");
                 break;
             }
             Err(err) => {
-                warn!("WiFi join failed with status={}, retrying...", err.status);
+                warn!("WiFi join failed: {}, retrying...", err.status);
                 Timer::after(Duration::from_secs(5)).await;
             }
         }
