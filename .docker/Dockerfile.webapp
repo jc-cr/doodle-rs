@@ -1,0 +1,25 @@
+FROM rust:1.90-slim-bullseye
+
+# Install minimal packages needed for web development
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install WASM target and web tools
+RUN rustup target add wasm32-unknown-unknown \
+    && cargo install trunk \
+    && cargo install wasm-bindgen-cli
+
+WORKDIR /home/webapp/app
+
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g $GID appuser && \
+    useradd -u $UID -g $GID -m appuser && \
+    chown -R appuser:appuser /usr/local/cargo && \
+    chown -R appuser:appuser /usr/local/rustup
+
+# Expose trunk's default port
+EXPOSE 8080

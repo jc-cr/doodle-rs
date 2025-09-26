@@ -4,26 +4,51 @@ services:
       context: .
       dockerfile: Dockerfile.rust
     volumes:
-      - ..:/app
+      - ../pico-2w-doodle-rs:/app
       - /home/jc/.secrets/pico2w-proj.env:/home/wifi.env:ro
       - /dev/bus/usb:/dev/bus/usb  # For USB device access
     user: "${UID:-1000}:${GID:-1000}"
     privileged: true  # Required for USB device access
     working_dir: /app
 
-
   pico_bash:
     extends: pico-dev
-    working_dir: /app
     stdin_open: true
     tty: true
     command: /bin/bash
   pico_build:
-     working_dir: /app/oled-wifi-control
      extends: pico-dev
-     command: bash -c "set -a && source /home/wifi.env && set +a && cargo build --target-dir . --target thumbv8m.main-none-eabihf"
+     command: bash -c "set -a && source /home/wifi.env && set +a && cargo build --target thumbv8m.main-none-eabihf"
   # Plug in board in boot mode
   pico_flash:
-     working_dir: /app/oled-wifi-control
      extends: pico-dev
-     command: bash -c "set -a && source /home/wifi.env && set +a && cargo run --release --target-dir . --target thumbv8m.main-none-eabihf"
+     command: bash -c "set -a && source /home/wifi.env && set +a && cargo run --release --target thumbv8m.main-none-eabihf"
+    
+  webapp-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.webapp
+    volumes:
+      - ../webapp-doodle-rs:/home/webapp/app:rw
+    ports:
+      - "8080:8080"
+    user: "${UID:-1000}:${GID:-1000}"
+    working_dir: /home/webapp/app
+    environment:
+      - TRUNK_SERVE_ADDRESS=0.0.0.0
+    
+  # For dev
+  webapp-serve:
+    extends: webapp-dev
+    command: trunk serve --address 0.0.0.0 --port 8080
+
+  # For production file gen
+  webapp-build:
+    extends: webapp-dev
+    command: trunk build --release
+
+  webapp-bash:
+    extends: webapp-dev
+    stdin_open: true
+    tty: true
+    command: /bin/bash

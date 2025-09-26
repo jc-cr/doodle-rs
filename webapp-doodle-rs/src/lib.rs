@@ -9,7 +9,7 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
 use serde_json;
 
 // Consts
-const PICO_URL:&str = "192.168.1.100";
+const PICO_URL:&str = "192.168.68.100";
 const PIXEL_GRID_SIZE: usize = 48;
 const CANVAS_SIZE: f64 = 480.0; // 10x scale for better UX
 const PIXEL_SIZE: f64 = CANVAS_SIZE / PIXEL_GRID_SIZE as f64; // 10 pixels per grid cell
