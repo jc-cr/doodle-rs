@@ -23,12 +23,6 @@ struct PixelRequest {
     state: bool,
 }
 
-// CORS headers as constants
-const CORS_HEADERS: &str = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 2\r\n\r\nOK";
-const CORS_PREFLIGHT: &str = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: 0\r\n\r\n";
-const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 9\r\n\r\nNot Found";
-const BAD_REQUEST: &str = "HTTP/1.1 400 Bad Request\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: 11\r\n\r\nBad Request";
-
 #[embassy_executor::task]
 pub async fn networking_task(
     mut wifi_stack: WifiStack,
@@ -67,36 +61,69 @@ pub async fn networking_task(
 
                 let response = handle_http_request(request, &mut pipe_writer).await;
                 
-                if let Err(e) = socket.write(response.as_bytes()).await {
-                    warn!("Write error: {:?}", e);
+                info!("Sending response: {=str}", &response[..response.len().min(100)]);
+                
+                // Write response using the correct TcpSocket API
+                let response_bytes = response.as_bytes();
+                let mut written = 0;
+                while written < response_bytes.len() {
+                    match socket.write(&response_bytes[written..]).await {
+                        Ok(n) if n > 0 => written += n,
+                        Ok(_) => break, // No progress
+                        Err(e) => {
+                            warn!("Write error: {:?}", e);
+                            break;
+                        }
+                    }
                 }
+                info!("Wrote {} of {} bytes", written, response_bytes.len());
             }
         }
 
+        // Always close and add delay
         socket.close();
-        Timer::after(Duration::from_millis(50)).await;
+        Timer::after(Duration::from_millis(100)).await;
     }
+}
+
+fn build_simple_response(body: &str) -> String<512> {
+    let mut response = String::new();
+    let _ = response.push_str("HTTP/1.1 200 OK\r\n");
+    let _ = response.push_str("Access-Control-Allow-Origin: *\r\n");
+    let _ = response.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+    let _ = response.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
+    let _ = response.push_str("Content-Type: text/plain\r\n");
+    let _ = response.push_str("Content-Length: ");
+    
+    // Simple length calculation
+    let body_len = body.len();
+    if body_len < 10 {
+        let _ = response.push((b'0' + body_len as u8) as char);
+    } else {
+        let _ = response.push('1');
+        let _ = response.push((b'0' + (body_len - 10) as u8) as char);
+    }
+    
+    let _ = response.push_str("\r\n\r\n");
+    let _ = response.push_str(body);
+    response
 }
 
 async fn handle_http_request(
     request: &str, 
     pipe_writer: &mut Writer<'static, CriticalSectionRawMutex, 64>
-) -> String<1024> {
-    let mut response = String::new();
-    
+) -> String<512> {
     // Parse HTTP method and path
     let lines: heapless::Vec<&str, 32> = request.lines().collect();
     if lines.is_empty() {
-        response.push_str(BAD_REQUEST).ok();
-        return response;
+        return build_simple_response("Bad Request");
     }
     
     let request_line = lines[0];
     let parts: heapless::Vec<&str, 8> = request_line.split_whitespace().collect();
     
     if parts.len() < 2 {
-        response.push_str(BAD_REQUEST).ok();
-        return response;
+        return build_simple_response("Bad Request");
     }
     
     let method = parts[0];
@@ -105,14 +132,16 @@ async fn handle_http_request(
     info!("Method: {=str}, Path: {=str}", method, path);
     
     match (method, path) {
-        // Handle CORS preflight requests
+        // Handle CORS preflight requests - CRITICAL for browser requests
         ("OPTIONS", _) => {
-            response.push_str(CORS_PREFLIGHT).ok();
+            info!("CORS preflight request");
+            build_simple_response("")
         },
         
         // Handle individual pixel updates
         ("POST", "/pixel") => {
             if let Some(json_body) = extract_json_body(request) {
+                info!("Received JSON body: {=str}", &json_body[..json_body.len().min(50)]);
                 match parse_pixel_request(json_body) {
                     Ok(pixel_req) => {
                         info!("Pixel update: x={}, y={}, state={}", pixel_req.x, pixel_req.y, pixel_req.state);
@@ -122,20 +151,20 @@ async fn handle_http_request(
                         let bytes_written = pipe_writer.write(&pixel_data).await;
                         info!("Wrote {} bytes to pipe", bytes_written);
                         
-                        response.push_str(CORS_HEADERS).ok();
+                        build_simple_response("OK")
                     },
                     Err(_) => {
                         warn!("Failed to parse pixel JSON");
-                        response.push_str(BAD_REQUEST).ok();
+                        build_simple_response("Invalid JSON")
                     }
                 }
             } else {
                 warn!("No JSON body found");
-                response.push_str(BAD_REQUEST).ok();
+                build_simple_response("Missing JSON")
             }
         },
         
-        // Handle clear command
+        // Handle clear command  
         ("POST", "/clear") => {
             info!("Clear display command received");
             
@@ -144,23 +173,20 @@ async fn handle_http_request(
             let bytes_written = pipe_writer.write(&clear_data).await;
             info!("Wrote {} bytes to pipe for clear command", bytes_written);
             
-            response.push_str(CORS_HEADERS).ok();
+            build_simple_response("Cleared")
         },
         
         // Handle basic status endpoint
         ("GET", "/") => {
-            let status_response = "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\nContent-Type: text/plain\r\nContent-Length: 18\r\n\r\nDoodle-RS Ready!\n";
-            response.push_str(status_response).ok();
+            build_simple_response("Doodle-RS Ready!")
         },
         
         // 404 for unknown endpoints
         _ => {
             warn!("Unknown endpoint: {} {}", method, path);
-            response.push_str(NOT_FOUND).ok();
+            build_simple_response("Not Found")
         }
     }
-    
-    response
 }
 
 fn extract_json_body(request: &str) -> Option<&str> {
