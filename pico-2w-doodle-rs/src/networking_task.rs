@@ -4,7 +4,6 @@
 use defmt::{info, warn};
 use core::str::from_utf8;
 use heapless::String;
-use serde::{Deserialize};
 
 use embassy_sync::pipe::{Writer};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -18,7 +17,6 @@ use crate::setup_devices::WifiStack;
 const WIFI_NETWORK: &str = env!("WIFI_ID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASS");
 
-#[derive(Deserialize)]
 struct PixelRequest {
     x: u8,
     y: u8,
@@ -42,11 +40,12 @@ pub async fn networking_task(
     connect_wifi(&mut wifi_stack).await;
     
     // HTTP server loop
-    let mut rx_buffer = [0; 2048];  // Increased for JSON parsing
+    let mut rx_buffer = [0; 2048];
     let mut tx_buffer = [0; 1024];
-    let mut request_buffer = [0; 1024];  // Increased for JSON body
+    let mut request_buffer = [0; 1024];
 
     loop {
+        // Dereference the stack
         let mut socket = TcpSocket::new(*wifi_stack.stack, &mut rx_buffer, &mut tx_buffer);
         socket.set_timeout(Some(Duration::from_secs(10)));
 
@@ -118,7 +117,12 @@ async fn handle_http_request(
                     Ok(pixel_req) => {
                         info!("Pixel update: x={}, y={}, state={}", pixel_req.x, pixel_req.y, pixel_req.state);
                         
+                        // Send pixel data through pipe to display task
+                        let pixel_data = [pixel_req.x, pixel_req.y, if pixel_req.state { 1 } else { 0 }];
+                        let bytes_written = pipe_writer.write(&pixel_data).await;
+                        info!("Wrote {} bytes to pipe", bytes_written);
                         
+                        response.push_str(CORS_HEADERS).ok();
                     },
                     Err(_) => {
                         warn!("Failed to parse pixel JSON");
@@ -135,6 +139,12 @@ async fn handle_http_request(
         ("POST", "/clear") => {
             info!("Clear display command received");
             
+            // Send clear command through pipe (special command: 255, 255, 2)
+            let clear_data = [255u8, 255u8, 2u8];
+            let bytes_written = pipe_writer.write(&clear_data).await;
+            info!("Wrote {} bytes to pipe for clear command", bytes_written);
+            
+            response.push_str(CORS_HEADERS).ok();
         },
         
         // Handle basic status endpoint
@@ -168,8 +178,6 @@ fn extract_json_body(request: &str) -> Option<&str> {
 
 fn parse_pixel_request(json: &str) -> Result<PixelRequest, ()> {
     // Simple JSON parsing for {"x": 10, "y": 5, "state": true}
-    // This is a basic parser - you might want to use serde_json_core for more robust parsing
-    
     let mut x = None;
     let mut y = None;
     let mut state = None;
