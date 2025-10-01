@@ -1,53 +1,29 @@
 //file: lib.rs
-// desc: serve webapp with queued pixel updates
+// desc: serve webapp with WebSocket for real-time pixel updates
 
-// Imports
 use leptos::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent};
-use serde_json;
-use std::collections::{HashMap, VecDeque};
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement, MouseEvent, WebSocket, MessageEvent, CloseEvent, ErrorEvent};
 use std::rc::Rc;
 use std::cell::RefCell;
 
 // Consts
-const PICO_URL:&str = "192.168.68.100";
+const PICO_URL: &str = "192.168.68.100";
 const PIXEL_GRID_SIZE: usize = 48;
 const CANVAS_SIZE: f64 = 480.0; // 10x scale for better UX
 const PIXEL_SIZE: f64 = CANVAS_SIZE / PIXEL_GRID_SIZE as f64; // 10 pixels per grid cell
 
-// Send rate limiting - adjust these values as needed
-const SEND_INTERVAL_MS: i32 = 5; // Send batches every x ms
-const MAX_BATCH_SIZE: usize = 2048;  // Max pixels per batch
-
-// Structs
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PixelCoord {
-    x: usize,
-    y: usize,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PixelUpdate {
-    coord: PixelCoord,
-    state: bool,
-}
-
-// Global pixel queue - using thread-local storage for web environment
+// Global WebSocket connection - using thread-local storage for web environment
 thread_local! {
-    static PIXEL_QUEUE: Rc<RefCell<VecDeque<PixelUpdate>>> = Rc::new(RefCell::new(VecDeque::new()));
-    static PENDING_PIXELS: Rc<RefCell<HashMap<PixelCoord, bool>>> = Rc::new(RefCell::new(HashMap::new()));
+    static WS_CONNECTION: Rc<RefCell<Option<WebSocket>>> = Rc::new(RefCell::new(None));
 }
 
-// Fns
 #[component]
 fn DrawingCanvas() -> impl IntoView {
     let canvas_ref = create_node_ref::<leptos::html::Canvas>();
     let (pixel_grid, set_pixel_grid) = create_signal([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
     let (is_drawing, set_is_drawing) = create_signal(false);
-    let (queue_stats, set_queue_stats) = create_signal((0usize, 0usize)); // (queue_size, pending_size)
-
     // Initialize canvas context
     let canvas_context = create_memo(move |_| {
         canvas_ref.get().and_then(|canvas| {
@@ -59,9 +35,9 @@ fn DrawingCanvas() -> impl IntoView {
         })
     });
 
-    // Start the pixel queue processor when component mounts
+    // Setup WebSocket connection when component mounts
     create_effect(move |_| {
-        start_pixel_queue_processor(set_queue_stats);
+        setup_websocket();
     });
 
     // Redraw canvas when pixel grid changes
@@ -103,7 +79,7 @@ fn DrawingCanvas() -> impl IntoView {
     });
 
     // Convert mouse coordinates to pixel grid coordinates
-    let mouse_to_pixel_coords = move |mouse_event: &MouseEvent| -> Option<PixelCoord> {
+    let mouse_to_pixel_coords = move |mouse_event: &MouseEvent| -> Option<(usize, usize)> {
         let canvas = canvas_ref.get()?;
         let canvas_element = canvas.unchecked_ref::<HtmlCanvasElement>();
         let rect = canvas_element.get_bounding_client_rect();
@@ -115,35 +91,35 @@ fn DrawingCanvas() -> impl IntoView {
         let pixel_y = (canvas_y / PIXEL_SIZE).floor() as usize;
         
         if pixel_x < PIXEL_GRID_SIZE && pixel_y < PIXEL_GRID_SIZE {
-            Some(PixelCoord { x: pixel_x, y: pixel_y })
+            Some((pixel_x, pixel_y))
         } else {
             None
         }
     };
 
-    // Handle drawing on pixel - now with queuing
-    let draw_pixel = move |coord: PixelCoord| {
+    // Handle drawing on pixel - now with WebSocket
+    let draw_pixel = move |x: usize, y: usize| {
         // Update visual grid immediately for responsive UI
         set_pixel_grid.update(|grid| {
-            grid[coord.y][coord.x] = true;
+            grid[y][x] = true;
         });
         
-        // Queue the pixel change for sending to Pico
-        queue_pixel_update(coord, true);
+        // Send pixel update via WebSocket (non-blocking)
+        send_pixel_via_websocket(x, y, true);
     };
 
     // Mouse event handlers
     let on_mouse_down = move |e: MouseEvent| {
-        if let Some(coord) = mouse_to_pixel_coords(&e) {
+        if let Some((x, y)) = mouse_to_pixel_coords(&e) {
             set_is_drawing.set(true);
-            draw_pixel(coord);
+            draw_pixel(x, y);
         }
     };
 
     let on_mouse_move = move |e: MouseEvent| {
         if is_drawing.get() {
-            if let Some(coord) = mouse_to_pixel_coords(&e) {
-                draw_pixel(coord);
+            if let Some((x, y)) = mouse_to_pixel_coords(&e) {
+                draw_pixel(x, y);
             }
         }
     };
@@ -156,14 +132,8 @@ fn DrawingCanvas() -> impl IntoView {
     let clear_canvas = move |_| {
         set_pixel_grid.set([[false; PIXEL_GRID_SIZE]; PIXEL_GRID_SIZE]);
         
-        // Clear any pending pixel updates and send clear command immediately
-        clear_pixel_queue();
-        spawn_local(async move {
-            match send_clear_to_pico().await {
-                Ok(_) => log::info!("Sent clear command to Pico 2W"),
-                Err(e) => log::error!("Failed to send clear command: {}", e),
-            }
-        });
+        // Send clear command via WebSocket
+        send_clear_via_websocket();
     };
 
     view! {
@@ -197,140 +167,119 @@ fn DrawingCanvas() -> impl IntoView {
                     }
                     count
                 }}</p>
-                <p class="sync-status">"✓ Real-time sync to Pico 2W"</p>
-                <p class="queue-stats">
-                    "Queue: " {move || queue_stats.get().0} " | Pending: " {move || queue_stats.get().1}
-                </p>
             </div>
         </div>
     }
 }
 
-// Queue management functions
-fn queue_pixel_update(coord: PixelCoord, state: bool) {
-    let update = PixelUpdate { coord, state };
+// WebSocket setup and management functions
+fn setup_websocket() {
+    use wasm_bindgen::closure::Closure;
     
-    PENDING_PIXELS.with(|pending| {
-        let mut pending = pending.borrow_mut();
-        // Update or insert the latest state for this coordinate
-        pending.insert(coord, state);
+    // Close existing connection if any
+    WS_CONNECTION.with(|ws_conn| {
+        if let Some(ws) = ws_conn.borrow().as_ref() {
+            let _ = ws.close();
+        }
+        *ws_conn.borrow_mut() = None;
+    });
+    
+    log::info!("Connecting to WebSocket at ws://{}:80", PICO_URL);
+    
+    // Create WebSocket connection
+    let ws_url = format!("ws://{}:80/ws", PICO_URL);
+    let ws = match WebSocket::new(&ws_url) {
+        Ok(ws) => ws,
+        Err(e) => {
+            log::error!("Failed to create WebSocket: {:?}", e);
+            return;
+        }
+    };
+    
+    // Set binary type to arraybuffer for efficient binary messages
+    ws.set_binary_type(web_sys::BinaryType::Arraybuffer);
+    
+    // Setup onopen handler
+    let onopen = Closure::wrap(Box::new(move |_| {
+        log::info!("WebSocket connected!");
+    }) as Box<dyn FnMut(JsValue)>);
+    ws.set_onopen(Some(onopen.as_ref().unchecked_ref()));
+    onopen.forget();
+    
+    // Setup onclose handler
+    let onclose = Closure::wrap(Box::new(move |e: CloseEvent| {
+        log::warn!("WebSocket closed: code={}, reason={}", e.code(), e.reason());
+        
+        // Clear connection
+        WS_CONNECTION.with(|ws_conn| {
+            *ws_conn.borrow_mut() = None;
+        });
+    }) as Box<dyn FnMut(CloseEvent)>);
+    ws.set_onclose(Some(onclose.as_ref().unchecked_ref()));
+    onclose.forget();
+    
+    // Setup onerror handler
+    let onerror = Closure::wrap(Box::new(move |e: ErrorEvent| {
+        log::error!("WebSocket error: {:?}", e);
+    }) as Box<dyn FnMut(ErrorEvent)>);
+    ws.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+    onerror.forget();
+    
+    // Setup onmessage handler (for potential server messages)
+    let onmessage = Closure::wrap(Box::new(move |e: MessageEvent| {
+        log::debug!("Received message from server: {:?}", e.data());
+    }) as Box<dyn FnMut(MessageEvent)>);
+    ws.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
+    onmessage.forget();
+    
+    // Store connection
+    WS_CONNECTION.with(|ws_conn| {
+        *ws_conn.borrow_mut() = Some(ws);
     });
 }
 
-fn clear_pixel_queue() {
-    PIXEL_QUEUE.with(|queue| {
-        queue.borrow_mut().clear();
-    });
-    PENDING_PIXELS.with(|pending| {
-        pending.borrow_mut().clear();
-    });
-}
-
-fn start_pixel_queue_processor(set_queue_stats: WriteSignal<(usize, usize)>) {
-    use wasm_bindgen_futures::spawn_local;
-    use gloo_timers::future::TimeoutFuture;
-    
-    spawn_local(async move {
-        loop {
-            // Wait for the next interval
-            TimeoutFuture::new(SEND_INTERVAL_MS as u32).await;
-            
-            // Process pending pixels
-            let pixels_to_send = PENDING_PIXELS.with(|pending| {
-                let mut pending = pending.borrow_mut();
-                if pending.is_empty() {
-                    return Vec::new();
-                }
+fn send_pixel_via_websocket(x: usize, y: usize, state: bool) {
+    WS_CONNECTION.with(|ws_conn| {
+        if let Some(ws) = ws_conn.borrow().as_ref() {
+            if ws.ready_state() == WebSocket::OPEN {
+                // Create binary message: [x, y, state]
+                let message = [x as u8, y as u8, if state { 1u8 } else { 0u8 }];
                 
-                // Take up to MAX_BATCH_SIZE pixels
-                let mut batch = Vec::new();
-                let mut keys_to_remove = Vec::new();
-                
-                for (&coord, &state) in pending.iter().take(MAX_BATCH_SIZE) {
-                    batch.push(PixelUpdate { coord, state });
-                    keys_to_remove.push(coord);
-                }
-                
-                // Remove processed pixels
-                for key in keys_to_remove {
-                    pending.remove(&key);
-                }
-                
-                batch
-            });
-            
-            // Update stats
-            let queue_size = PIXEL_QUEUE.with(|q| q.borrow().len());
-            let pending_size = PENDING_PIXELS.with(|p| p.borrow().len());
-            set_queue_stats.set((queue_size, pending_size));
-            
-            // Send pixels if any
-            if !pixels_to_send.is_empty() {
-                log::debug!("Sending batch of {} pixels", pixels_to_send.len());
-                
-                for pixel_update in pixels_to_send {
-                    match send_pixel_change_to_pico(pixel_update.coord.x, pixel_update.coord.y, pixel_update.state).await {
-                        Ok(_) => {
-                            log::debug!("Sent pixel: ({}, {}) = {}", pixel_update.coord.x, pixel_update.coord.y, pixel_update.state);
-                        },
-                        Err(e) => {
-                            log::error!("Failed to send pixel change: {}", e);
-                            // On error, we could re-queue the pixel, but for now just log and continue
-                        }
+                match ws.send_with_u8_array(&message) {
+                    Ok(_) => {
+                        log::debug!("Sent pixel: ({}, {}) = {}", x, y, state);
                     }
-                    
-                    // Small delay between pixels in the batch to avoid overwhelming
-                    TimeoutFuture::new(5).await;
+                    Err(e) => {
+                        log::error!("Failed to send pixel: {:?}", e);
+                    }
                 }
+            } else {
+                log::warn!("WebSocket not open, cannot send pixel");
             }
         }
     });
 }
 
-// Function to send individual pixel change to Pico 2W
-async fn send_pixel_change_to_pico(x: usize, y: usize, state: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    
-    // Replace with your Pico 2W's IP address
-    let pico_pixel_url = format!("http://{}/pixel", PICO_URL); // New endpoint for individual pixels
-    
-    // Send as JSON: {"x": 10, "y": 5, "state": true}
-    let pixel_data = serde_json::json!({
-        "x": x,
-        "y": y,
-        "state": state
+fn send_clear_via_websocket() {
+    WS_CONNECTION.with(|ws_conn| {
+        if let Some(ws) = ws_conn.borrow().as_ref() {
+            if ws.ready_state() == WebSocket::OPEN {
+                // Send clear command: [255, 255, 2]
+                let message = [255u8, 255u8, 2u8];
+                
+                match ws.send_with_u8_array(&message) {
+                    Ok(_) => {
+                        log::info!("Sent clear command");
+                    }
+                    Err(e) => {
+                        log::error!("Failed to send clear command: {:?}", e);
+                    }
+                }
+            } else {
+                log::warn!("WebSocket not open, cannot send clear command");
+            }
+        }
     });
-    
-    let response = client
-        .post(pico_pixel_url)
-        .header("Content-Type", "application/json")
-        .json(&pixel_data)
-        .send()
-        .await?;
-    
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("HTTP error: {}", response.status()).into())
-    }
-}
-
-// Function to send clear command to Pico 2W
-async fn send_clear_to_pico() -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
-    
-    let pico_clear_url = format!("http://{}/clear", PICO_URL);
-    
-    let response = client
-        .post(pico_clear_url)
-        .send()
-        .await?;
-    
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("HTTP error: {}", response.status()).into())
-    }
 }
 
 #[component]
@@ -352,7 +301,7 @@ fn App() -> impl IntoView {
                 }
                 
                 .controls {
-                    margin-bottom: 20px;
+                    margin-bottom: 10px;
                     display: flex;
                     justify-content: center;
                     gap: 10px;
@@ -370,16 +319,6 @@ fn App() -> impl IntoView {
                     background: #e9e9e9;
                 }
                 
-                .send-btn {
-                    background: #4CAF50 !important;
-                    color: white !important;
-                    border: 1px solid #45a049 !important;
-                }
-                
-                .send-btn:hover {
-                    background: #45a049 !important;
-                }
-                
                 .canvas-container {
                     display: inline-block;
                     border: 2px solid #333;
@@ -395,18 +334,11 @@ fn App() -> impl IntoView {
                 .info p {
                     margin: 5px 0;
                 }
-                
-                .queue-stats {
-                    font-family: monospace;
-                    font-size: 12px;
-                    color: #999;
-                }
                 "
             </style>
             
             <h1>"Doodle-RS"</h1>
             <p>"Draw on the canvas below. Each square represents a pixel on your 48x48 OLED display."</p>
-            <p class="help-text">"Pixel updates are queued and sent at a controlled rate to prevent overwhelming the Pico."</p>
             
             <DrawingCanvas/>
         </div>
@@ -416,6 +348,6 @@ fn App() -> impl IntoView {
 #[wasm_bindgen(start)]
 pub fn main() {
     console_error_panic_hook::set_once();
-    console_log::init_with_level(log::Level::Info).ok();
+    console_log::init_with_level(log::Level::Debug).ok();
     leptos::mount_to_body(App);
 }

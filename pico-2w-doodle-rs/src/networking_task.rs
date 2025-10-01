@@ -1,9 +1,8 @@
 // file: networking_task.rs
-// desc: handle networking
+// desc: handle networking with WebSocket support
 
 use defmt::{info, warn};
 use core::str::from_utf8;
-use heapless::String;
 
 use embassy_sync::pipe::{Writer};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -11,17 +10,14 @@ use embassy_net::tcp::TcpSocket;
 use cyw43::JoinOptions;
 use embassy_time::{Duration, Timer};
 
+use embedded_websocket as ws;
+use embedded_websocket::{WebSocketSendMessageType, WebSocketReceiveMessageType};
+
 use crate::setup_devices::WifiStack;
 
 // Source from env variables WIFI_ID, WIFI_PASS
 const WIFI_NETWORK: &str = env!("WIFI_ID");
 const WIFI_PASSWORD: &str = env!("WIFI_PASS");
-
-struct PixelRequest {
-    x: u8,
-    y: u8,
-    state: bool,
-}
 
 #[embassy_executor::task]
 pub async fn networking_task(
@@ -33,238 +29,185 @@ pub async fn networking_task(
     // Connect to WiFi
     connect_wifi(&mut wifi_stack).await;
     
-    // HTTP server loop - increased buffer sizes for better performance
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
+    // WebSocket server loop
+    let mut rx_buffer = [0; 2048];
+    let mut tx_buffer = [0; 2048];
 
     loop {
-        // Create socket with minimal timeout for fast cycling
+        // Create socket
         let mut socket = TcpSocket::new(*wifi_stack.stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(Duration::from_millis(500)));
+        // No timeout - WebSocket connections should stay open
+        socket.set_timeout(None);
 
-        // Try to accept connection - this should be VERY fast
+        info!("Waiting for connection on port 80");
+        
         match socket.accept(80).await {
             Ok(_) => {
-                info!("Connection from {:?}", socket.remote_endpoint());
+                info!("Connection accepted");
                 
-                // Handle this connection - read request quickly
-                let mut request_buffer = [0; 2048];
-                match socket.read(&mut request_buffer).await {
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        let request = from_utf8(&request_buffer[..bytes_read]).unwrap_or("Invalid UTF-8");
-                        info!("Request: {=str}", &request[..request.len().min(100)]);
-
-                        // Generate and send response immediately
-                        let response = handle_http_request(request, &mut pipe_writer).await;
-                        let response_bytes = response.as_bytes();
-                        
-                        // Write entire response
-                        let mut written = 0;
-                        while written < response_bytes.len() {
-                            match socket.write(&response_bytes[written..]).await {
-                                Ok(n) if n > 0 => {
-                                    written += n;
-                                },
-                                Ok(_) => break,
-                                Err(e) => {
-                                    warn!("Write failed: {:?}", e);
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // Ensure data is sent before closing
-                        let _ = socket.flush().await;
-                        info!("Response sent: {} bytes", written);
-                    },
-                    Ok(_) => info!("Empty request"),
-                    Err(e) => warn!("Read error: {:?}", e),
-                }
+                // Handle this WebSocket connection
+                handle_websocket_connection(&mut socket, &mut pipe_writer).await;
                 
-                // Close this connection cleanly
+                // Close socket cleanly
                 socket.close();
                 
-                // MINIMAL delay before accepting next connection
-                Timer::after(Duration::from_millis(1)).await;
+                // Brief delay before accepting next connection
+                Timer::after(Duration::from_millis(10)).await;
             },
             Err(_) => {
-                // No connection waiting, loop immediately to try again
-                // This makes the server VERY responsive
-                Timer::after(Duration::from_micros(100)).await;
+                Timer::after(Duration::from_millis(100)).await;
             }
         }
     }
 }
 
-fn build_simple_response(body: &str) -> String<512> {
-    let mut response = String::new();
-    let _ = response.push_str("HTTP/1.1 200 OK\r\n");
-    let _ = response.push_str("Access-Control-Allow-Origin: *\r\n");
-    let _ = response.push_str("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
-    let _ = response.push_str("Access-Control-Allow-Headers: Content-Type\r\n");
-    let _ = response.push_str("Connection: close\r\n");
-    let _ = response.push_str("Content-Type: text/plain\r\n");
-    let _ = response.push_str("Content-Length: ");
+async fn handle_websocket_connection(
+    socket: &mut TcpSocket<'_>,
+    pipe_writer: &mut Writer<'static, CriticalSectionRawMutex, 64>,
+) {
+    let mut read_buffer = [0u8; 1024];
+    let mut read_cursor = 0;
+    let mut write_buffer = [0u8; 256];
     
-    // Fixed content-length calculation to handle any size
-    let body_len = body.len();
-    
-    // Convert length to string digits
-    if body_len == 0 {
-        let _ = response.push('0');
-    } else {
-        // Handle multi-digit lengths properly
-        let mut n = body_len;
-        let mut digits = [0u8; 8];
-        let mut digit_count = 0;
-        
-        // Extract digits
-        while n > 0 {
-            digits[digit_count] = (n % 10) as u8;
-            n /= 10;
-            digit_count += 1;
-        }
-        
-        // Add digits in reverse order
-        for i in (0..digit_count).rev() {
-            let _ = response.push((b'0' + digits[i]) as char);
+    // Read HTTP upgrade request
+    loop {
+        match socket.read(&mut read_buffer[read_cursor..]).await {
+            Ok(0) => return,
+            Ok(n) => {
+                read_cursor += n;
+                
+                // Try to parse HTTP request using httparse
+                let mut headers = [httparse::EMPTY_HEADER; 16];
+                let mut request = httparse::Request::new(&mut headers);
+                
+                match request.parse(&read_buffer[..read_cursor]) {
+                    Ok(httparse::Status::Complete(_)) => {
+                        // Parse WebSocket headers
+                        let header_iter = request.headers.iter().map(|h| (h.name, h.value));
+                        
+                        if let Ok(Some(ws_context)) = ws::read_http_header(header_iter) {
+                            // Send WebSocket handshake
+                            let mut websocket = ws::WebSocketServer::new_server();
+                            
+                            if let Ok(len) = websocket.server_accept(&ws_context.sec_websocket_key, None, &mut write_buffer) {
+                                let _ = socket.write(&write_buffer[..len]).await;
+                                let _ = socket.flush().await;
+                                
+                                // Enter message loop
+                                websocket_message_loop(socket, &mut websocket, pipe_writer).await;
+                            }
+                        }
+                        return;
+                    }
+                    Ok(httparse::Status::Partial) => {
+                        // Need more data, continue reading
+                        if read_cursor >= read_buffer.len() {
+                            return; // Buffer full
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+            Err(_) => return,
         }
     }
-    
-    let _ = response.push_str("\r\n\r\n");
-    let _ = response.push_str(body);
-    response
 }
 
-async fn handle_http_request(
-    request: &str, 
-    pipe_writer: &mut Writer<'static, CriticalSectionRawMutex, 64>
-) -> String<512> {
-    // Parse HTTP method and path
-    let lines: heapless::Vec<&str, 32> = request.lines().collect();
-    if lines.is_empty() {
-        return build_simple_response("Bad Request");
-    }
+async fn websocket_message_loop(
+    socket: &mut TcpSocket<'_>,
+    websocket: &mut ws::WebSocketServer,
+    pipe_writer: &mut Writer<'static, CriticalSectionRawMutex, 64>,
+) {
+    let mut read_buffer = [0u8; 512];
+    let mut frame_buffer = [0u8; 256];
+    let mut write_buffer = [0u8; 256];
     
-    let request_line = lines[0];
-    let parts: heapless::Vec<&str, 8> = request_line.split_whitespace().collect();
+    info!("WebSocket connected");
     
-    if parts.len() < 2 {
-        return build_simple_response("Bad Request");
-    }
-    
-    let method = parts[0];
-    let path = parts[1];
-    
-    info!("Method: {=str}, Path: {=str}", method, path);
-    
-    match (method, path) {
-        // Handle CORS preflight requests - CRITICAL for browser requests
-        ("OPTIONS", _) => {
-            info!("CORS preflight request");
-            // Return empty body for OPTIONS requests
-            build_simple_response("")
-        },
-        
-        // Handle individual pixel updates
-        ("POST", "/pixel") => {
-            if let Some(json_body) = extract_json_body(request) {
-                info!("JSON: {=str}", &json_body[..json_body.len().min(50)]);
-                match parse_pixel_request(json_body) {
-                    Ok(pixel_req) => {
-                        info!("Pixel: x={}, y={}, state={}", pixel_req.x, pixel_req.y, pixel_req.state);
-                        
-                        // Send pixel data through pipe to display task
-                        let pixel_data = [pixel_req.x, pixel_req.y, if pixel_req.state { 1 } else { 0 }];
-                        let _ = pipe_writer.write(&pixel_data).await;
-                        
-                        build_simple_response("OK")
-                    },
+    loop {
+        // Read data from socket
+        match socket.read(&mut read_buffer).await {
+            Ok(0) => {
+                info!("Connection closed");
+                return;
+            }
+            Ok(bytes_read) => {
+                // Process WebSocket frame
+                match websocket.read(&read_buffer[..bytes_read], &mut frame_buffer) {
+                    Ok(ws_result) => {
+                        match ws_result.message_type {
+                            WebSocketReceiveMessageType::Binary => {
+                                let payload = &frame_buffer[..ws_result.len_to];
+                                
+                                // Expect 3-byte messages: [x, y, state]
+                                if payload.len() == 3 {
+                                    let x = payload[0];
+                                    let y = payload[1];
+                                    let state = payload[2];
+                                    
+                                    // Check for clear command (255, 255, 2)
+                                    if x == 255 && y == 255 && state == 2 {
+                                        info!("Clear");
+                                    } else {
+                                        info!("Pixel: x={}, y={}, s={}", x, y, state);
+                                    }
+                                    
+                                    // Write to pipe for display task
+                                    let _ = pipe_writer.write(payload).await;
+                                }
+                            }
+                            WebSocketReceiveMessageType::Text => {
+                                if let Ok(text) = from_utf8(&frame_buffer[..ws_result.len_to]) {
+                                    info!("Text: {}", text);
+                                }
+                            }
+                            WebSocketReceiveMessageType::CloseMustReply => {
+                                info!("Close frame");
+                                
+                                // Send close reply
+                                if let Ok(len) = websocket.write(
+                                    WebSocketSendMessageType::CloseReply,
+                                    true,
+                                    &frame_buffer[..ws_result.len_to],
+                                    &mut write_buffer,
+                                ) {
+                                    let _ = socket.write(&write_buffer[..len]).await;
+                                    let _ = socket.flush().await;
+                                }
+                                
+                                return;
+                            }
+                            WebSocketReceiveMessageType::Ping => {
+                                info!("Ping");
+                                
+                                // Respond with pong
+                                if let Ok(len) = websocket.write(
+                                    WebSocketSendMessageType::Pong,
+                                    true,
+                                    &frame_buffer[..ws_result.len_to],
+                                    &mut write_buffer,
+                                ) {
+                                    let _ = socket.write(&write_buffer[..len]).await;
+                                    let _ = socket.flush().await;
+                                }
+                            }
+                            _ => {
+                                info!("Other message type");
+                            }
+                        }
+                    }
+                    Err(ws::Error::ReadFrameIncomplete) => {
+                        continue;
+                    }
                     Err(_) => {
-                        warn!("Failed to parse pixel JSON");
-                        build_simple_response("Invalid JSON")
+                        return;
                     }
                 }
-            } else {
-                warn!("No JSON body found");
-                build_simple_response("Missing JSON")
             }
-        },
-        
-        // Handle clear command  
-        ("POST", "/clear") => {
-            info!("Clear display command");
-            
-            // Send clear command through pipe (special command: 255, 255, 2)
-            let clear_data = [255u8, 255u8, 2u8];
-            let _ = pipe_writer.write(&clear_data).await;
-            
-            build_simple_response("Cleared")
-        },
-        
-        // Handle basic status endpoint
-        ("GET", "/") => {
-            build_simple_response("Doodle-RS Ready!")
-        },
-        
-        // 404 for unknown endpoints
-        _ => {
-            warn!("Unknown: {} {}", method, path);
-            build_simple_response("Not Found")
-        }
-    }
-}
-
-fn extract_json_body(request: &str) -> Option<&str> {
-    if let Some(body_start) = request.find("\r\n\r\n") {
-        let body = &request[body_start + 4..];
-        if !body.trim().is_empty() {
-            Some(body.trim())
-        } else {
-            None
-        }
-    } else {
-        None
-    }
-}
-
-fn parse_pixel_request(json: &str) -> Result<PixelRequest, ()> {
-    // Simple JSON parsing for {"x": 10, "y": 5, "state": true}
-    let mut x = None;
-    let mut y = None;
-    let mut state = None;
-    
-    // Remove braces and split by comma
-    let cleaned = json.trim().trim_start_matches('{').trim_end_matches('}');
-    
-    for pair in cleaned.split(',') {
-        let pair = pair.trim();
-        if let Some(colon_pos) = pair.find(':') {
-            let key = pair[..colon_pos].trim().trim_matches('"');
-            let value = pair[colon_pos + 1..].trim();
-            
-            match key {
-                "x" => x = value.parse().ok(),
-                "y" => y = value.parse().ok(),
-                "state" => state = value.parse().ok(),
-                _ => {}
+            Err(_) => {
+                return;
             }
         }
-    }
-    
-    if let (Some(x_val), Some(y_val), Some(state_val)) = (x, y, state) {
-        // Bounds checking for 48x48 display
-        if x_val < 48 && y_val < 48 {
-            Ok(PixelRequest {
-                x: x_val,
-                y: y_val,
-                state: state_val,
-            })
-        } else {
-            Err(())
-        }
-    } else {
-        Err(())
     }
 }
 
@@ -295,9 +238,8 @@ async fn connect_wifi(wifi_stack: &mut WifiStack) {
     
     if let Some(config) = wifi_stack.stack.config_v4() {
         info!("Network configured!");
-        info!("IP Address: {}", config.address.address());
+        info!("IP: {}", config.address.address());
         info!("Gateway: {:?}", config.gateway);
-        info!("HTTP Server ready at: http://{}", config.address.address());
     }
 
     // Turn on LED if connected

@@ -36,6 +36,12 @@ ssd1306 = "0.8.4"
 embedded-graphics = "0.8.1"
 heapless = "0.8"
 
+# WebSocket support
+embedded-websocket = { version = "0.9.4", default-features = false }
+httparse = { version = "1.9", default-features = false }
+
+
+
 
 [profile.dev]
 debug = 2

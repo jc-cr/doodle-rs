@@ -1,5 +1,5 @@
 services:
-  pico-dev:
+  pico_dev:
     build:
       context: .
       dockerfile: Dockerfile.rust
@@ -12,16 +12,16 @@ services:
     working_dir: /app
 
   pico_bash:
-    extends: pico-dev
+    extends: pico_dev
     stdin_open: true
     tty: true
     command: /bin/bash
   pico_build:
-     extends: pico-dev
+     extends: pico_dev
      command: bash -c "set -a && source /home/wifi.env && set +a && cargo build --target thumbv8m.main-none-eabihf"
   # Plug in board in boot mode
   pico_flash:
-     extends: pico-dev
+     extends: pico_dev
      command: bash -c "set -a && source /home/wifi.env && set +a && cargo run --release --target thumbv8m.main-none-eabihf"
     
   webapp-dev:
