@@ -20,7 +20,9 @@ RUN rustup default stable \
 
 # Install cargo tools
 RUN cargo install flip-link \
-    && cargo install probe-rs-tools --locked
+    && cargo install probe-rs-tools --locked \
+    && cargo install cargo-binutils \
+    && cargo install cargo-machete
 
 # Build picotool from source
 RUN cd /tmp \

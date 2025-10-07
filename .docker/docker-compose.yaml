@@ -20,9 +20,9 @@ services:
      extends: pico_dev
      command: bash -c "set -a && source /home/wifi.env && set +a && cargo build --target thumbv8m.main-none-eabihf"
   # Plug in board in boot mode
-  pico_flash:
-     extends: pico_dev
-     command: bash -c "set -a && source /home/wifi.env && set +a && cargo run --release --target thumbv8m.main-none-eabihf"
+  pico_size:
+    extends: pico_dev
+    command: bash -c "set -a && source /home/wifi.env && set +a && cargo size --release --target thumbv8m.main-none-eabihf -- -A"
     
   webapp-dev:
     build:
