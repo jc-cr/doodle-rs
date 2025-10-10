@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y \
 # Install Rust targets and tools
 RUN rustup default stable \
     && rustup target add thumbv8m.main-none-eabihf \
-    && rustup component add llvm-tools-preview
+    && rustup component add llvm-tools-preview \
+    && rustup component add rustfmt
 
 # Install cargo tools
 RUN cargo install flip-link \

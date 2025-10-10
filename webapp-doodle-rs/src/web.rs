@@ -1,5 +1,5 @@
 // file: web.rs
-// desc: handle web app operations
+// desc: handle web app operations with MNIST inference
 
 use leptos::*;
 use wasm_bindgen::prelude::*;
@@ -9,6 +9,7 @@ use std::rc::Rc;
 use std::cell::RefCell;
 
 use crate::AppConfig;
+use crate::inference::get_inference;
 
 // Global WebSocket connection - using thread-local storage for web environment
 thread_local! {
@@ -22,6 +23,8 @@ fn DrawingCanvas(config: AppConfig) -> impl IntoView {
         vec![vec![false; config.pixel_grid_size]; config.pixel_grid_size]
     );
     let (is_drawing, set_is_drawing) = create_signal(false);
+    let (current_digit, set_current_digit) = create_signal::<Option<u8>>(None);
+    let (inference_pending, set_inference_pending) = create_signal(false);
     
     // Initialize canvas context
     let canvas_context = create_memo(move |_| {
@@ -77,6 +80,40 @@ fn DrawingCanvas(config: AppConfig) -> impl IntoView {
         }
     });
 
+    // Debounced inference - run 500ms after last pixel drawn
+    create_effect(move |_| {
+        if inference_pending.get() {
+            let grid = pixel_grid.get();
+            
+            set_timeout(
+                move || {
+                    // Convert Vec<Vec<bool>> to [[bool; 48]; 48]
+                    let mut canvas_array: [[bool; 48]; 48] = [[false; 48]; 48];
+                    for (y, row) in grid.iter().enumerate() {
+                        for (x, &pixel) in row.iter().enumerate() {
+                            canvas_array[y][x] = pixel;
+                        }
+                    }
+                    
+                    // Run inference
+                    log::info!("Running inference...");
+                    let digit = get_inference(&canvas_array);
+                    
+                    if digit == 255 {
+                        set_current_digit.set(None);
+                        log::info!("No pixels drawn, clearing digit");
+                    } else {
+                        set_current_digit.set(Some(digit));
+                        log::info!("Predicted digit: {}", digit);
+                    }
+                    
+                    set_inference_pending.set(false);
+                },
+                std::time::Duration::from_millis(500),
+            );
+        }
+    });
+
     // Convert mouse coordinates to pixel grid coordinates
     let mouse_to_pixel_coords = move |mouse_event: &MouseEvent| -> Option<(usize, usize)> {
         let canvas = canvas_ref.get()?;
@@ -103,8 +140,14 @@ fn DrawingCanvas(config: AppConfig) -> impl IntoView {
             grid[y][x] = true;
         });
         
+        // Get current digit for the message (or 255 if none)
+        let digit = current_digit.get().unwrap_or(255);
+        
         // Send pixel update via WebSocket (non-blocking)
-        send_pixel_via_websocket(x, y, true);
+        send_pixel_via_websocket(x, y, true, digit);
+        
+        // Mark that we need to run inference soon
+        set_inference_pending.set(true);
     };
 
     // Mouse event handlers
@@ -132,6 +175,10 @@ fn DrawingCanvas(config: AppConfig) -> impl IntoView {
         set_pixel_grid.set(
             vec![vec![false; config.pixel_grid_size]; config.pixel_grid_size]
         );
+        
+        // Clear digit
+        set_current_digit.set(None);
+        set_inference_pending.set(false);
         
         // Send clear command via WebSocket
         send_clear_via_websocket();
@@ -168,6 +215,13 @@ fn DrawingCanvas(config: AppConfig) -> impl IntoView {
                     }
                     count
                 }}</p>
+                <p style="font-size: 18px; font-weight: bold; color: #2196F3;">
+                    "Predicted digit: " 
+                    {move || match current_digit.get() {
+                        Some(d) => d.to_string(),
+                        None => "--".to_string()
+                    }}
+                </p>
             </div>
         </div>
     }
@@ -239,17 +293,21 @@ fn setup_websocket(pico_url: &str) {
     });
 }
 
-fn send_pixel_via_websocket(x: usize, y: usize, state: bool) {
-
+fn send_pixel_via_websocket(x: usize, y: usize, state: bool, digit: u8) {
     WS_CONNECTION.with(|ws_conn| {
         if let Some(ws) = ws_conn.borrow().as_ref() {
             if ws.ready_state() == WebSocket::OPEN {
-                // Create binary message: [x, y, state]
-                let message = [x as u8, y as u8, if state { 1u8 } else { 0u8 }];
+                // Create binary message: [x, y, state, digit]
+                let message = [
+                    x as u8, 
+                    y as u8, 
+                    if state { 1u8 } else { 0u8 },
+                    digit
+                ];
                 
                 match ws.send_with_u8_array(&message) {
                     Ok(_) => {
-                        log::debug!("Sent pixel: ({}, {}) = {}", x, y, state);
+                        log::debug!("Sent pixel: ({}, {}) = {}, digit={}", x, y, state, digit);
                     }
                     Err(e) => {
                         log::error!("Failed to send pixel: {:?}", e);
@@ -266,8 +324,8 @@ fn send_clear_via_websocket() {
     WS_CONNECTION.with(|ws_conn| {
         if let Some(ws) = ws_conn.borrow().as_ref() {
             if ws.ready_state() == WebSocket::OPEN {
-                // Send clear command: [255, 255, 2]
-                let message = [255u8, 255u8, 2u8];
+                // Send clear command: [255, 255, 2, 255]
+                let message = [255u8, 255u8, 2u8, 255u8];
                 
                 match ws.send_with_u8_array(&message) {
                     Ok(_) => {

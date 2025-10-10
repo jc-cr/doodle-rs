@@ -1,8 +1,11 @@
 //file: lib.rs
 // desc: serve webapp with configuration
 
-pub mod web;
-pub mod model;
+mod web;
+mod inference;
+mod model;
+
+
 
 use leptos::*;
 use wasm_bindgen::prelude::*;

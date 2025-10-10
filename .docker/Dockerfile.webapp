@@ -9,8 +9,10 @@ RUN apt-get update && apt-get install -y \
 
 # Install WASM target and web tools
 RUN rustup target add wasm32-unknown-unknown \
+    && rustup component add rustfmt \
     && cargo install trunk \
     && cargo install wasm-bindgen-cli
+
 
 WORKDIR /home/webapp/app
 
