@@ -68,6 +68,12 @@ fn draw_canvas_to_display(
     display: &mut Display,
     drawing_canvas: &[[bool; CANVAS_SIZE]; CANVAS_SIZE]
 ) {
+
+    // Draw title in the top section
+    Text::new("Digit Guess: {}", Point::new(0, 10), text_style)
+        .draw(&mut display)
+        .unwrap();
+
     // Draw each pixel from the canvas
     for (y, row) in drawing_canvas.iter().enumerate() {
         for (x, &pixel_state) in row.iter().enumerate() {
@@ -120,10 +126,6 @@ pub async fn display_task(
             // Clear the display
             display.clear(BinaryColor::Off).unwrap();
             
-            // Draw title in the top section
-            Text::new("Doodle rs", Point::new(0, 10), text_style)
-                .draw(&mut display)
-                .unwrap();
             
             // Draw the canvas pixels
             draw_canvas_to_display(&mut display, &drawing_canvas);

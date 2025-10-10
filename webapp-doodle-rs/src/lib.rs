@@ -2,6 +2,7 @@
 // desc: serve webapp with configuration
 
 pub mod web;
+pub mod model;
 
 use leptos::*;
 use wasm_bindgen::prelude::*;

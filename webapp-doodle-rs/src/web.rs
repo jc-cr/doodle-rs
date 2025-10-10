@@ -96,7 +96,7 @@ fn DrawingCanvas(config: AppConfig) -> impl IntoView {
         }
     };
 
-    // Handle drawing on pixel - now with WebSocket
+    // Handle drawing on pixel
     let draw_pixel = move |x: usize, y: usize| {
         // Update visual grid immediately for responsive UI
         set_pixel_grid.update(|grid| {
@@ -240,6 +240,7 @@ fn setup_websocket(pico_url: &str) {
 }
 
 fn send_pixel_via_websocket(x: usize, y: usize, state: bool) {
+
     WS_CONNECTION.with(|ws_conn| {
         if let Some(ws) = ws_conn.borrow().as_ref() {
             if ws.ready_state() == WebSocket::OPEN {
