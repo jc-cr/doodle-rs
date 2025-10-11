@@ -6,8 +6,7 @@ use burn::{
     tensor::Tensor,
 };
 
-mod model;
-use model::mnist::Model;
+use crate::model::mnist::Model;
 
 type Backend = NdArray<f32>;
 
